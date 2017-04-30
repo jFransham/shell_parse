@@ -130,6 +130,8 @@ pub fn parse_statement<R: Stream<Item=char>>(
             many(
                 try(
                     (
+                        // TODO: We waste time re-parsing whitespace here, can
+                        //       we do better?
                         whitespace2,
                         parser(parse_expression)
                     )
