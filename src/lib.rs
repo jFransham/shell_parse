@@ -121,7 +121,6 @@ pub fn parse_statement<R: Stream<Item=char>>(
 
     let whitespace1 = optional(parser(mandatory_whitespace));
     let whitespace2 = optional(parser(mandatory_whitespace));
-    let whitespace3 = optional(parser(mandatory_whitespace));
 
     (
         whitespace1,
@@ -132,13 +131,13 @@ pub fn parse_statement<R: Stream<Item=char>>(
                     (
                         // TODO: We waste time re-parsing whitespace here, can
                         //       we do better?
-                        whitespace2,
+                        parser(mandatory_whitespace),
                         parser(parse_expression)
                     )
                 ).map(|(_, exp)| exp)
             ),
         ).map(|(name, args)| Statement::FunctionCall(name, args)),
-        whitespace3,
+        whitespace2,
     ).map(
         |(_, s, _)| s
     ).parse_stream(input)
@@ -203,8 +202,13 @@ pub fn parse_expression<R: Stream<Item=char>>(
                             token('\\'),
                             satisfy(is_special)
                         )
-                    ).map(|(_, b)| b) as BoxParse<R, _>,
-                    box token('\\'),
+                    ).map(|(_, b)| b),
+                    box try(
+                        (
+                            token('\\'),
+                            not_followed_by(token('\n'))
+                        )
+                    ).map(|(f, _)| f),
                 ]
             )
         ).map(|(_, a)| a)
@@ -216,9 +220,9 @@ pub fn parse_expression<R: Stream<Item=char>>(
                 box variable_reference.map(
                     Expression::VariableReference
                 ) as BoxParse<R, _>,
-                box single_string.map(Expression::Literal) as BoxParse<R, _>,
-                box glob.map(Expression::Glob) as BoxParse<R, _>,
-                box raw_string.map(Expression::Literal) as BoxParse<R, _>,
+                box single_string.map(Expression::Literal),
+                box glob.map(Expression::Glob),
+                box raw_string.map(Expression::Literal),
             ]
         )
     ).map(
@@ -347,6 +351,26 @@ mod tests {
         assert_eq!(
             parse_statement(
                 "   ls -clt $PWD # Hello, world! \n"
+            ).unwrap().0,
+            Statement::FunctionCall(
+                Expression::Literal(Literal::String("ls".into())),
+                vec![
+                    Expression::Literal(
+                        Literal::String("-clt".into())
+                    ),
+                    Expression::VariableReference(
+                        "PWD".into()
+                    ),
+                ]
+            ) 
+        );
+    }
+
+    #[test]
+    fn literal_newline() {
+        assert_eq!(
+            parse_statement(
+                "   ls -clt\\\n   $PWD"
             ).unwrap().0,
             Statement::FunctionCall(
                 Expression::Literal(Literal::String("ls".into())),
