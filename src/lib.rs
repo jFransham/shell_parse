@@ -26,10 +26,7 @@ pub enum Statement {
         name: String,
         body: FunctionDef,
     },
-    FunctionCall {
-        name: String, 
-        arguments: Vec<Expression>,
-    }
+    FunctionCall(Expression, Vec<Expression>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -67,9 +64,81 @@ fn single_string<R: Stream<Item=char>>(input: R) -> ParseResult<Literal, R> {
     between(
         token('\''),
         token('\''),
-        many(single_string_char).map(|chrs: String| chrs),
+        many(single_string_char)
     ).map(
         Literal::String
+    ).parse_stream(input)
+}
+
+fn comment_or_newline<R: Stream<Item=char>>(
+    input: R
+) -> ParseResult<(), R> {
+    (
+        optional(
+            (
+                token('#'),
+                skip_many(none_of(iter::once('\n'))),
+            )
+        ),
+        token('\n'),
+    ).map(|_| ()).parse_stream(input)
+}
+
+pub fn parse_statement<R: Stream<Item=char>>(
+    input: R
+) -> ParseResult<Statement, R> {
+    fn is_whitespace_char(c: char) -> bool {
+        c.is_whitespace() & (c != '\n')
+    }
+
+    fn escaped_newline<R: Stream<Item=char>>(
+        input: R
+    ) -> ParseResult<(), R> {
+        try(
+            (
+                token('\\'),
+                token('\n'),
+            )
+        ).map(|_| ()).parse_stream(input)
+    }
+
+    fn mandatory_whitespace<R: Stream<Item=char>>(
+        input: R
+    ) -> ParseResult<(), R> {
+        skip_many1(
+            choice(
+                [
+                    box skip_many1(
+                        satisfy(is_whitespace_char)
+                    ) as BoxParse<R, _>,
+                    box skip_many1(
+                        parser(escaped_newline)
+                    ) as BoxParse<R, _>,
+                ]
+            )
+        ).parse_stream(input)
+    }
+
+    let whitespace1 = optional(parser(mandatory_whitespace));
+    let whitespace2 = optional(parser(mandatory_whitespace));
+    let whitespace3 = optional(parser(mandatory_whitespace));
+
+    (
+        whitespace1,
+        (
+            parser(parse_expression),
+            many(
+                try(
+                    (
+                        whitespace2,
+                        parser(parse_expression)
+                    )
+                ).map(|(_, exp)| exp)
+            ),
+        ).map(|(name, args)| Statement::FunctionCall(name, args)),
+        whitespace3,
+    ).map(
+        |(_, s, _)| s
     ).parse_stream(input)
 }
 
@@ -83,23 +152,30 @@ pub fn parse_expression<R: Stream<Item=char>>(
         (c == '_')
     }
 
+    fn is_special(c: char) -> bool {
+        (c == '\\') |
+        (c == '$') |
+        (c == '[') |
+        (c == ']') |
+        (c == '{') |
+        (c == '}') |
+        (c == '"') |
+        (c == '\'') |
+        (c == ' ') |
+        (c == '*') |
+        (c == '?') |
+        (c == '|') |
+        (c == '&') |
+        (c == '#') |
+        (c == ';')
+    }
+
     let glob = choice(
         [
             box token('*').map(|_| Glob::Many) as BoxParse<R, _>,
             box token('?').map(|_| Glob::One) as BoxParse<R, _>,
         ]
     );
-
-    // let comment_or_newline =
-    //     (
-    //         optional(
-    //             (
-    //                 token('#'),
-    //                 many(none_of(iter::once('\n'))),
-    //             )
-    //         ),
-    //         token('\n'),
-    //     );
 
     let single_string = parser(single_string);
 
@@ -114,21 +190,22 @@ pub fn parse_expression<R: Stream<Item=char>>(
         )
     ).map(|(_, b): (_, String)| b);
 
-    let unescaped_in_raw_string = is_ident;
-
     let raw_string = many1(
-        choice(
-            [
-                box satisfy(unescaped_in_raw_string) as BoxParse<R, _>,
-                box try(
-                    (
-                        token('\\'),
-                        satisfy(|c| !unescaped_in_raw_string(c))
-                    ).map(|(_, b)| b)
-                ) as BoxParse<R, _>,
-                box token('\\'),
-            ]
-        )
+        (
+            try(not_followed_by(token('\n'))),
+            choice(
+                [
+                    box satisfy(|c| !is_special(c)) as BoxParse<R, _>,
+                    box try(
+                        (
+                            token('\\'),
+                            satisfy(is_special)
+                        )
+                    ).map(|(_, b)| b) as BoxParse<R, _>,
+                    box token('\\'),
+                ]
+            )
+        ).map(|(_, a)| a)
     ).map(Literal::String);
 
     let mut expression = many1(
@@ -238,6 +315,46 @@ mod tests {
                     ),
                     Expression::Glob(Glob::One),
                     Expression::Literal(Literal::String("txt".into())),
+                ]
+            ) 
+        );
+    }
+
+    #[test]
+    fn statement() {
+        assert_eq!(
+            parse_statement(
+                "   ls -clt $PWD \n"
+            ).unwrap().0,
+            Statement::FunctionCall(
+                Expression::Literal(Literal::String("ls".into())),
+                vec![
+                    Expression::Literal(
+                        Literal::String("-clt".into())
+                    ),
+                    Expression::VariableReference(
+                        "PWD".into()
+                    ),
+                ]
+            ) 
+        );
+    }
+
+    #[test]
+    fn comments() {
+        assert_eq!(
+            parse_statement(
+                "   ls -clt $PWD # Hello, world! \n"
+            ).unwrap().0,
+            Statement::FunctionCall(
+                Expression::Literal(Literal::String("ls".into())),
+                vec![
+                    Expression::Literal(
+                        Literal::String("-clt".into())
+                    ),
+                    Expression::VariableReference(
+                        "PWD".into()
+                    ),
                 ]
             ) 
         );
