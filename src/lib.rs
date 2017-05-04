@@ -41,9 +41,6 @@ impl<T: Into<String>> From<T> for VariableReference {
     }
 }
 
-// $* is equal to `Escaped(Arguments)`
-// "$*" is equal to `Escaped(Escaped(Arguments))` (this is the only method of
-// getting a nested Escaped in the AST)
 #[derive(Debug, Clone, PartialEq)]
 pub enum MagicVar {
     // $0: The name of the script
@@ -54,8 +51,11 @@ pub enum MagicVar {
     //     is the only user-visible form of arrays unless I implement the Bash
     //     extension of user-defined arrays
     Arguments,
+    // $*: An array of the passed arguments, joined with the first character of
+    //     $IFS, as a string
+    ArgumentString,
     // $N: Starts from 1 in the script, but 0 internally.
-    //     This is because $0 is considered a "special parameter".
+    //     This is because $0 is considered a "special parameter"
     Argument(u32),
     // $_: The last argument of the last command
     LastLastArgument,
@@ -509,6 +509,7 @@ pub fn parse_one_expression<R: Stream<Item=char>>(
                         as BoxParse<_, _>,
                     box token('#').map(|_| MagicVar::NumArgs),
                     box token('@').map(|_| MagicVar::Arguments),
+                    box token('*').map(|_| MagicVar::ArgumentString),
                     box token('?').map(|_| MagicVar::LastExitCode),
                     box token('!').map(|_| MagicVar::LastProcId),
                     box token('$').map(|_| MagicVar::ProcId),
@@ -1036,7 +1037,6 @@ mod tests {
         )
     }
 
-    // TODO: Can't parse the `curl` statement
     #[test]
     fn everything() {
         use std::fs::File;
