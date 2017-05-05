@@ -21,7 +21,20 @@ pub enum Statement {
         body: FunctionDef,
     },
     FunctionCall(Expression, Vec<Expression>),
+    IfStatement(Box<Statement>, Vec<Statement>),
+    // Acts like a linked list - can we do better?
+    // This also makes the `None` case unnecessarily difficult to handle -
+    // we should have seperate "set parameters" and "with env" cases, but that's
+    // hard to parse correctly.
+    // Probably the best thing to do is have a `parse_statement_or_env` fn
+    // seperate from `parse_statement`
+    // Maybe parse into an explicit `WithEnv`/`Statement` ADT and then flatten
+    // that into a `Statement`
+    WithEnv((VariableName, Expression), Option<Box<Statement>>),
 }
+
+// TODO: Make this Rc<str>
+pub type VariableName = String;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Glob {
@@ -32,7 +45,7 @@ pub enum Glob {
 #[derive(Debug, Clone, PartialEq)]
 pub enum VariableReference {
     Magic(MagicVar),
-    Ref(String),
+    Ref(VariableName),
 }
 
 impl<T: Into<String>> From<T> for VariableReference {
@@ -108,20 +121,20 @@ pub enum Expression {
     Escape(Box<Expression>),
 }
 
-type BoxParse<'a, T, O> = Box<Parser<Input=T, Output=O> + 'a>;
+type RefParse<'a, T, O> = &'a mut (Parser<Input=T, Output=O> + 'a);
 
 fn single_string<R: Stream<Item=char>>(input: R) -> ParseResult<String, R> {
-    let single_string_char = choice(
-        [
-            box try(string("\\'")).map(|_| '\'') as BoxParse<R, _>,
-            box none_of(iter::once('\'')) as BoxParse<R, _>,
-        ]
-    );
-
     between(
         token('\''),
         token('\''),
-        many(single_string_char)
+        many(
+            choice(
+                [
+                    &mut try(string("\\'")).map(|_| '\'') as RefParse<R, _>,
+                    &mut none_of(iter::once('\'')),
+                ]
+            )
+        )
     ).map(|c: String| c).parse_stream(input)
 }
 
@@ -147,19 +160,18 @@ fn statement_terminator<R: Stream<Item=char>>(
             optional(parser(mandatory_whitespace)),
             choice(
                 [
-                    box parser(comment_or_newline) as BoxParse<_, _>,
-                    box token(';').map(|_| ()),
+                    &mut parser(comment_or_newline) as RefParse<_, _>,
+                    &mut token(';').map(|_| ()),
                 ]
             ),
+            optional(parser(mandatory_whitespace)),
         )
     ).map(|_| ()).parse_stream(input)
 }
 
 pub fn parse_statements<R: Stream<Item=char>>(
     input: R,
-) -> impl Iterator<Item=Statement>
-
-{
+) -> impl Iterator<Item=Statement> {
     struct StatementStream<T>(Option<T>);
 
     impl<T: Stream<Item=char>> Iterator for StatementStream<T> {
@@ -214,12 +226,12 @@ fn mandatory_whitespace<R: Stream<Item=char>>(
     skip_many1(
         choice(
             [
-                box skip_many1(
+                &mut skip_many1(
                     satisfy(is_whitespace_char)
-                ) as BoxParse<R, _>,
-                box skip_many1(
+                ) as RefParse<R, _>,
+                &mut skip_many1(
                     parser(escaped_newline)
-                ) as BoxParse<R, _>,
+                ),
             ]
         )
     ).parse_stream(input)
@@ -228,32 +240,94 @@ fn mandatory_whitespace<R: Stream<Item=char>>(
 pub fn parse_statement<R: Stream<Item=char>>(
     input: R,
 ) -> ParseResult<Statement, R> {
-    let whitespace1 = optional(parser(mandatory_whitespace));
-    let whitespace2 = optional(parser(mandatory_whitespace));
+    fn whitespace<R: Stream<Item=char>>() ->
+        impl Parser<Input=R, Output=Option<()>>
+    {
+        optional(parser(mandatory_whitespace))
+    }
 
-    (
-        whitespace1,
+    fn set_variable<R: Stream<Item=char>>() ->
+        impl Parser<Input=R, Output=(VariableName, Expression)>
+    {
         (
+            parser(parse_ident),
+            // Don't allow whitespace here
+            token('='),
             parser(parse_expression),
-            many(
+        ).map(|(name, _, exp)| (name, exp))
+    }
+
+    // TODO: Add esac, done
+    let invalid_function_names = [
+        string("fi"),
+    ];
+
+    let mut if_statement = (
+        string("if"),
+        parser(parse_statement),
+        (parser(statement_terminator), whitespace()),
+        between(
+            (string("then"), skip_many(parser(statement_terminator))),
+            string("fi"),
+            many1(
                 try(
                     (
-                        // TODO: We waste time re-parsing whitespace here after
-                        //       the last expression, since the
-                        //       `parse_expression` will fail and then the
-                        //       whitespace will get rolled back. This is only
-                        //       an issue for EOL whitespace and line
-                        //       continuations, so it's not so bad, but we can
-                        //       do better.
-                        //
-                        //       Maybe switch the order of these two statements?
-                        parser(mandatory_whitespace),
-                        parser(parse_expression)
+                        parser(parse_statement),
+                        skip_many1(parser(statement_terminator)),
                     )
-                ).map(|(_, exp)| exp)
-            ),
-        ).map(|(name, args)| Statement::FunctionCall(name, args)),
-        whitespace2,
+                ).map(|(s, _)| s)
+            )
+        ),
+    ).map(
+        |(_, head, _, body)| Statement::IfStatement(box head, body)
+    );
+
+    let mut env_statement = (
+        try(set_variable()),
+        optional(
+            (
+                parser(mandatory_whitespace),
+                parser(parse_statement),
+            )
+        ),
+    ).map(
+        |(vars, opt_stmt): (_, Option<_>)|
+        Statement::WithEnv(
+            vars,
+            opt_stmt.map(|(_, stmt)| box stmt),
+        )
+    );
+
+    let mut func_call = (
+        not_followed_by(choice(invalid_function_names)),
+        parser(parse_expression),
+        many(
+            try(
+                (
+                    // TODO: We waste time re-parsing whitespace here after
+                    //       the last expression, since the
+                    //       `parse_expression` will fail and then the
+                    //       whitespace will get rolled back. This is only
+                    //       an issue for EOL whitespace and line
+                    //       continuations, so it's not so bad, but we can
+                    //       do better.
+                    //
+                    //       Maybe switch the order of these two statements?
+                    parser(mandatory_whitespace),
+                    parser(parse_expression)
+                )
+            ).map(|(_, exp)| exp)
+        ),
+    ).map(|(_, name, args)| Statement::FunctionCall(name, args));
+
+    (
+        whitespace(),
+        choice([
+            &mut env_statement as RefParse<_, _>,
+            &mut if_statement,
+            &mut func_call,
+        ]),
+        whitespace(),
     ).map(
         |(_, s, _)| s
     ).parse_stream(input)
@@ -266,8 +340,6 @@ pub fn parse_raw_string_char<R: Stream<Item=char>>(
             c == '$'  ||
             c == '('  ||
             c == ')'  ||
-            c == '['  ||
-            c == ']'  ||
             c == '{'  ||
             c == '}'  ||
             c == '"'  ||
@@ -285,14 +357,14 @@ pub fn parse_raw_string_char<R: Stream<Item=char>>(
         try(not_followed_by(token('\n'))),
         choice(
             [
-                box satisfy(|c| !is_special(c)) as BoxParse<R, _>,
-                box try(
+                &mut satisfy(|c| !is_special(c)) as RefParse<R, _>,
+                &mut try(
                     (
                         token('\\'),
                         satisfy(is_special)
                     )
                 ).map(|(_, b)| b),
-                box try(
+                &mut try(
                     (
                         token('\\'),
                         not_followed_by(token('\n'))
@@ -327,14 +399,14 @@ pub fn parse_variable_options_char<R: Stream<Item=char>>(
 
     choice(
         [
-            box satisfy(|c| !is_special(c)) as BoxParse<R, _>,
-            box try(
+            &mut satisfy(|c| !is_special(c)) as RefParse<R, _>,
+            &mut try(
                 (
                     token('\\'),
                     satisfy(is_special)
                 )
             ).map(|(_, b)| b),
-            box token('\\'),
+            &mut token('\\'),
         ]
     ).parse_stream(input)
 }
@@ -344,8 +416,8 @@ pub fn parse_one_expression_or_double_string<R: Stream<Item=char>>(
 ) -> ParseResult<Expression, R> {
     choice(
         [
-            box parser(parse_one_expression) as BoxParse<_, _>,
-            box between(
+            &mut parser(parse_one_expression) as RefParse<_, _>,
+            &mut between(
                 token('"'),
                 token('"'),
                 parser(parse_double_string),
@@ -394,14 +466,14 @@ pub fn parse_double_string_char<R: Stream<Item=char>>(
 
     choice(
         [
-            box satisfy(|c| !is_special(c)) as BoxParse<R, _>,
-            box try(
+            &mut satisfy(|c| !is_special(c)) as RefParse<R, _>,
+            &mut try(
                 (
                     token('\\'),
                     satisfy(is_special)
                 )
             ).map(|(_, b)| b),
-            box token('\\'),
+            &mut token('\\'),
         ]
     ).parse_stream(input)
 }
@@ -438,15 +510,15 @@ pub fn parse_substitutable_string<
     many1(
         choice(
             [
-                box try(
+                &mut try(
                     many1(
                         choice([
-                            box parser(parse_double_string_char) as BoxParse<_, _>,
-                            box satisfy(char::is_whitespace),
+                            &mut parser(parse_double_string_char) as RefParse<_, _>,
+                            &mut satisfy(char::is_whitespace),
                         ])
                     )
-                ).map(Expression::Literal) as BoxParse<_, _>,
-                box try(expression_parser),
+                ).map(Expression::Literal) as RefParse<_, _>,
+                &mut try(expression_parser),
             ]
         )
     ).map(
@@ -467,60 +539,65 @@ pub fn parse_substitutable_string<
     )
 }
 
-pub fn parse_one_expression<R: Stream<Item=char>>(
-    input: R
-) -> ParseResult<Expression, R> {
-    fn is_ident(c: char) -> bool {
-        (c >= 'a' && c <= 'z') ||
+fn is_ident(c: char) -> bool {
+    (c >= 'a' && c <= 'z') ||
         (c >= 'A' && c <= 'Z') ||
         (c >= '0' && c <= '9') ||
-        (c == '_')
-    }
+        (c == '_') ||
+        (c == '[') ||
+        (c == ']')
+}
 
-    fn is_ident_start(c: char) -> bool {
-        (c >= 'a' && c <= 'z') ||
-            (c >= 'A' && c <= 'Z') ||
-            (c == '_')
-    }
+fn is_ident_start(c: char) -> bool {
+    (c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c == '_') ||
+        (c == '[') ||
+        (c == ']')
+}
 
-    fn ident<R: Stream<Item=char>>(input: R) -> ParseResult<String, R> {
-        (satisfy(is_ident_start), many(satisfy(is_ident))).map(
-            |(left, rest): (char, String)| format!("{}{}", left, rest)
-        ).parse_stream(input)
-    }
+fn parse_ident<R: Stream<Item=char>>(input: R) -> ParseResult<String, R> {
+    (satisfy(is_ident_start), many(satisfy(is_ident))).map(
+        |(left, rest): (char, String)| format!("{}{}", left, rest)
+    ).parse_stream(input)
+}
 
-    fn variable_reference<R: Stream<Item=char>>(
-        input: R
-    ) -> ParseResult<VariableReference, R> {
-        choice(
-            [
-                // `try` is fine here since we only need 1 char lookahead
-                box try(
-                    (
-                        token('_'),
-                        not_followed_by(satisfy(is_ident)),
-                    )
-                ).map(
-                    |_| VariableReference::Magic(MagicVar::LastLastArgument)
-                ) as BoxParse<_, _>,
-                box parser(ident).map(String::into),
-                box choice([
-                    box token('0').map(|_| MagicVar::ScriptName)
-                        as BoxParse<_, _>,
-                    box token('#').map(|_| MagicVar::NumArgs),
-                    box token('@').map(|_| MagicVar::Arguments),
-                    box token('*').map(|_| MagicVar::ArgumentString),
-                    box token('?').map(|_| MagicVar::LastExitCode),
-                    box token('!').map(|_| MagicVar::LastProcId),
-                    box token('$').map(|_| MagicVar::ProcId),
-                    box token('-').map(|_| MagicVar::ShellArgs),
-                    box many1(digit())
-                        .and_then(|d: String| d.parse().map(MagicVar::Argument)),
-                ]).map(VariableReference::Magic)
-            ]
-        ).parse_stream(input)
-    }
+fn parse_variable_reference<R: Stream<Item=char>>(
+    input: R
+) -> ParseResult<VariableReference, R> {
+    choice(
+        [
+            // `try` is fine here since we only need 1 char lookahead
+            &mut try(
+                (
+                    token('_'),
+                    not_followed_by(satisfy(is_ident)),
+                )
+            ).map(
+                |_| VariableReference::Magic(MagicVar::LastLastArgument)
+            ) as RefParse<_, _>,
+            &mut parser(parse_ident).map(String::into),
+            &mut choice([
+                &mut token('0').map(|_| MagicVar::ScriptName)
+                    as RefParse<_, _>,
+                &mut token('#').map(|_| MagicVar::NumArgs),
+                &mut token('@').map(|_| MagicVar::Arguments),
+                &mut token('*').map(|_| MagicVar::ArgumentString),
+                &mut token('?').map(|_| MagicVar::LastExitCode),
+                &mut token('!').map(|_| MagicVar::LastProcId),
+                &mut token('$').map(|_| MagicVar::ProcId),
+                &mut token('-').map(|_| MagicVar::ShellArgs),
+                &mut many1(digit())
+                    .and_then(|d: String| d.parse().map(MagicVar::Argument)),
+            ]).map(VariableReference::Magic)
+        ]
+    ).parse_stream(input)
+}
 
+
+fn parse_bracketed_var<R: Stream<Item=char>>(
+    input: R
+) -> ParseResult<Expression, R> {
     // I hate using this `also_null` hack, but it's the cleanest way I can do
     // this. In my defense, the standardised behaviour is a hack too.
     fn make_and_then(
@@ -605,10 +682,74 @@ pub fn parse_one_expression<R: Stream<Item=char>>(
         }
     }
 
+    between(
+        token('{'),
+        token('}'),
+        (
+            parser(parse_variable_reference),
+            optional(
+                (
+                    optional(token(':').map(|_: char| ())),
+                    choice(
+                        [
+                            &mut token('-').map(
+                                |_| make_default as
+                                    fn(bool, Option<Rc<Expression>>) ->
+                                    LookupBehavior
+                            ) as RefParse<R, _>,
+                            &mut token('=').map(
+                                |_| make_assign as _
+                            ),
+                            &mut token('?').map(
+                                |_| make_fail as _
+                            ),
+                            &mut token('+').map(
+                                |_| make_and_then as _
+                            ),
+                        ]
+                    ),
+                    parser(parse_variable_options),
+                ).map(
+                    |(
+                        maybe_colon,
+                        make_fn,
+                        exp
+                    ): (
+                        Option<()>,
+                        fn(bool, Option<Rc<Expression>>) ->
+                            LookupBehavior,
+                        Option<Expression>,
+                    )| ->
+                        LookupBehavior
+                    {
+                        make_fn(
+                            maybe_colon.is_some(),
+                            exp.map(Rc::new),
+                        )
+                    }
+                ),
+            )
+        )
+    ).map(
+        |(name, behaviour): (
+            VariableReference, Option<LookupBehavior>
+        )|
+        Expression::VariableReference(
+            name,
+            behaviour.unwrap_or_default(),
+        )
+    ).parse_stream(input)
+}
+
+pub fn parse_one_expression<R: Stream<Item=char>>(
+    input: R
+) -> ParseResult<Expression, R> {
+    let mut star_tok = token('*').map(|_| Glob::Many);
+    let mut qust_tok = token('?').map(|_| Glob::One);
     let glob = choice(
         [
-            box token('*').map(|_| Glob::Many) as BoxParse<R, _>,
-            box token('?').map(|_| Glob::One) as BoxParse<R, _>,
+            &mut star_tok as RefParse<R, _>,
+            &mut qust_tok,
         ]
     );
 
@@ -623,77 +764,24 @@ pub fn parse_one_expression<R: Stream<Item=char>>(
         )
     ).map(|(_, second)| second);
 
-    let variable = (
+    let mut var_ref = parser(parse_variable_reference)
+        .map(
+            |s|
+            Expression::VariableReference(
+                s,
+                Default::default(),
+            )
+        );
+    let mut bracketed_var_ref = parser(parse_bracketed_var);
+
+    let mut variable = (
         token('$'),
         choice(
             [
                 // TODO: Have seperate datatypes representing the special vars
                 //       compared to "regular" vars.
-                box parser(variable_reference)
-                    .map(
-                        |s|
-                        Expression::VariableReference(
-                            s,
-                            Default::default(),
-                        )
-                    ) as BoxParse<R, _>,
-                box between(
-                    token('{'),
-                    token('}'),
-                    (
-                        parser(variable_reference),
-                        optional(
-                            (
-                                optional(token(':').map(|_: char| ())),
-                                choice(
-                                    [
-                                        box token('-').map(
-                                            |_| make_default as
-                                                fn(bool, Option<Rc<Expression>>) ->
-                                                    LookupBehavior
-                                        ) as BoxParse<R, _>,
-                                        box token('=').map(
-                                            |_| make_assign as _
-                                        ),
-                                        box token('?').map(
-                                            |_| make_fail as _
-                                        ),
-                                        box token('+').map(
-                                            |_| make_and_then as _
-                                        ),
-                                    ]
-                                ),
-                                parser(parse_variable_options),
-                            ).map(
-                                |(
-                                    maybe_colon,
-                                    make_fn,
-                                    exp
-                                ): (
-                                    Option<()>,
-                                    fn(bool, Option<Rc<Expression>>) ->
-                                        LookupBehavior,
-                                    Option<Expression>,
-                                )| ->
-                                    LookupBehavior
-                                {
-                                    make_fn(
-                                        maybe_colon.is_some(),
-                                        exp.map(Rc::new),
-                                    )
-                                }
-                            ),
-                        )
-                    )
-                ).map(
-                    |(name, behaviour): (
-                        VariableReference, Option<LookupBehavior>
-                    )|
-                    Expression::VariableReference(
-                        name,
-                        behaviour.unwrap_or_default(),
-                    )
-                ),
+                &mut var_ref as RefParse<R, _>,
+                &mut bracketed_var_ref,
             ]
         )
     ).map(|(_, second)| second);
@@ -702,14 +790,14 @@ pub fn parse_one_expression<R: Stream<Item=char>>(
 
     choice(
         [
-            box try(expansion)
+            &mut try(expansion)
                 .map(Box::new)
                 .map(Expression::Expand)
-                as BoxParse<R, _>,
-            box variable,
-            box single_string.map(Expression::Literal),
-            box glob.map(Expression::Glob),
-            box raw_string.map(Expression::Literal),
+                as RefParse<R, _>,
+            &mut variable,
+            &mut single_string.map(Expression::Literal),
+            &mut glob.map(Expression::Glob),
+            &mut raw_string.map(Expression::Literal),
         ]
     ).parse_stream(input)
 }
@@ -1011,6 +1099,13 @@ mod tests {
     }
 
     #[test]
+    fn expression_no_whitespace_at_end() {
+        let out = parse_expression("test");
+
+        assert!(out.unwrap().1.into_inner().is_empty());
+    }
+
+    #[test]
     fn command_substitution() {
         let out = parse_statement("echo $(echo ${test})");
 
@@ -1031,6 +1126,95 @@ mod tests {
                                 )
                             ]
                         )
+                    ),
+                ]
+            )
+        )
+    }
+
+    #[test]
+    fn set_vars() {
+        let out = parse_statement("first=1 second=$first");
+        
+        assert_eq!(
+            out.unwrap().0,
+            Statement::WithEnv(
+                (
+                    "first".into(),
+                    Expression::Literal("1".into()),
+                ),
+                Some(
+                    box Statement::WithEnv(
+                        (
+                            "second".into(),
+                            Expression::VariableReference(
+                                "first".into(),
+                                Default::default(),
+                            ),
+                        ),
+                        None,
+                    )
+                ),
+            )
+        )
+    }
+
+    #[test]
+    fn run_with_vars() {
+        let out = parse_statement("first=1 second=$first do_thing one two");
+        
+        assert_eq!(
+            out.unwrap().0,
+            Statement::WithEnv(
+                (
+                    "first".into(),
+                    Expression::Literal("1".into())
+                ),
+                Some(
+                    box Statement::WithEnv(
+                        (
+                            "second".into(),
+                            Expression::VariableReference(
+                                "first".into(),
+                                Default::default(),
+                            )
+                        ),
+                        Some(
+                            box Statement::FunctionCall(
+                                Expression::Literal("do_thing".into()),
+                                vec![
+                                    Expression::Literal("one".into()),
+                                    Expression::Literal("two".into()),
+                                ]
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    #[test]
+    fn if_statement() {
+        let out = parse_statement("if test 1 -le 2; then; echo test; fi");
+        
+        assert_eq!(
+            out.unwrap().0,
+            Statement::IfStatement(
+                box Statement::FunctionCall(
+                    Expression::Literal("test".into()),
+                    vec![
+                        Expression::Literal("1".into()),
+                        Expression::Literal("-le".into()),
+                        Expression::Literal("2".into()),
+                    ]
+                ),
+                vec![
+                    Statement::FunctionCall(
+                        Expression::Literal("echo".into()),
+                        vec![
+                            Expression::Literal("test".into()),
+                        ]
                     ),
                 ]
             )
