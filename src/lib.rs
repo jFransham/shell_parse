@@ -423,7 +423,7 @@ pub fn parse_statement<R: Stream<Item=char>>(
     ]).parse_stream(input)
 }
 
-pub fn parse_raw_string_char<R: Stream<Item=char>>(
+fn parse_raw_string_char<R: Stream<Item=char>>(
     input: R
 ) -> ParseResult<char, R> {
     fn is_special(c: char) -> bool {
@@ -466,62 +466,71 @@ pub fn parse_raw_string_char<R: Stream<Item=char>>(
     ).map(|(_, a)| a).parse_stream(input)
 }
 
-pub fn parse_variable_options_char<R: Stream<Item=char>>(
+fn parse_one_expression_or_string<R: Stream<Item=char>>(
     input: R
-) -> ParseResult<char, R> {
-    fn is_special(c: char) -> bool {
-        c == '\\' ||
-            c == '$'  ||
-            c == '('  ||
-            c == ')'  ||
-            c == '['  ||
-            c == ']'  ||
-            c == '{'  ||
-            c == '}'  ||
-            c == '"'  ||
-            c == '\'' ||
-            c == '*'  ||
-            c == '?'  ||
-            c == '|'  ||
-            c == '&'  ||
-            c == '#'  ||
-            c == ';'
+) -> ParseResult<Expression, R> {
+    // HACK HACK HACK
+    // If Dash didn't implement backticks my life would be much easier but I'll
+    // put this technically-working hack in instead of ruining my fairly-clean
+    // parsing logic.
+    fn backtick_expansion<R: Stream<Item=char>>(
+        input: R
+    ) -> ParseResult<Expression, R> {
+        let escaped_backtick = (token('\\'), token('`')).map(|_| '`');
+        let escaped_backslash = (token('\\'), token('\\')).map(|_| '\\');
+        let mut anything_else = none_of(iter::once('`'));
+
+        between(
+            token('`'),
+            token('`'),
+            optional(
+                many1(
+                    choice([
+                        &mut try(escaped_backslash) as RefParse<_, _>,
+                        // We `try` here since we want to allow backslashes to be
+                        // interpolated literally if they don't have anything to escape.
+                        // I'm pretty sure this is the POSIX/Dash behaviour. 
+                        &mut try(escaped_backtick),
+                        &mut anything_else,
+                    ])
+                )
+            )
+        ).map(
+            |maybe_backtick_string| {
+                if let Some(backtick_string) = maybe_backtick_string {
+                    Expression::Expand(
+                        box Statement::FunctionCall(
+                            vec![],
+                            Expression::Literal("eval".into()),
+                            vec![Expression::Literal(backtick_string)],
+                        )
+                    )
+                } else {
+                    // Yes, Dash's logic here really is this convoluted
+                    Expression::Literal("".into())
+                }
+            }
+        ).parse_stream(input)
     }
 
     choice(
         [
-            &mut satisfy(|c| !is_special(c)) as RefParse<R, _>,
-            &mut try(
-                (
-                    token('\\'),
-                    satisfy(is_special)
-                )
-            ).map(|(_, b)| b),
-            &mut token('\\'),
-        ]
-    ).parse_stream(input)
-}
-
-pub fn parse_one_expression_or_double_string<R: Stream<Item=char>>(
-    input: R
-) -> ParseResult<Expression, R> {
-    choice(
-        [
-            &mut parser(parse_one_expression) as RefParse<_, _>,
+            &mut parser(backtick_expansion) as RefParse<_, _>,
             &mut between(
                 token('"'),
                 token('"'),
                 parser(parse_double_string),
             ),
+            &mut parser(parse_one_expression),
         ]
     ).parse_stream(input)
 }
 
-pub fn parse_expression<R: Stream<Item=char>>(
+fn parse_expression<R: Stream<Item=char>>(
     input: R
 ) -> ParseResult<Expression, R> {
     many1(
-        parser(parse_one_expression_or_double_string)
+        parser(parse_one_expression_or_string)
     ).map(
         |all: Vec<_>|
         if all.len() == 1 {
@@ -533,7 +542,7 @@ pub fn parse_expression<R: Stream<Item=char>>(
 }
 
 // TODO: Roll *_char functions together
-pub fn parse_double_string_char<R: Stream<Item=char>>(
+fn parse_double_string_char<R: Stream<Item=char>>(
     input: R
 ) -> ParseResult<char, R> {
     fn is_special(c: char) -> bool {
@@ -569,7 +578,7 @@ pub fn parse_double_string_char<R: Stream<Item=char>>(
     ).parse_stream(input)
 }
 
-pub fn parse_double_string<R: Stream<Item=char>>(
+fn parse_double_string<R: Stream<Item=char>>(
     input: R,
 ) -> ParseResult<Expression, R> {
     parse_substitutable_string(
@@ -583,16 +592,16 @@ pub fn parse_double_string<R: Stream<Item=char>>(
     )
 }
 
-pub fn parse_variable_options<R: Stream<Item=char>>(
+fn parse_variable_options<R: Stream<Item=char>>(
     input: R,
 ) -> ParseResult<Option<Expression>, R> {
     parse_substitutable_string(
         input,
-        parser(parse_one_expression_or_double_string),
+        parser(parse_one_expression_or_string),
     )
 }
 
-pub fn parse_substitutable_string<
+fn parse_substitutable_string<
     R: Stream<Item=char>,
     E: Parser<Input=R, Output=Expression>
 >(
@@ -832,7 +841,7 @@ fn parse_bracketed_var<R: Stream<Item=char>>(
     ).parse_stream(input)
 }
 
-pub fn parse_one_expression<R: Stream<Item=char>>(
+fn parse_one_expression<R: Stream<Item=char>>(
     input: R
 ) -> ParseResult<Expression, R> {
     let mut star_tok = token('*').map(|_| Glob::Many);
@@ -1402,19 +1411,25 @@ mod tests {
     }
 
     #[test]
-    fn everything() {
-        use std::fs::File;
-        use std::io::Read;
+    fn backticks() {
+        let out = parse_expression("`pwd`/first-file");
 
-        let mut file = File::open("test.sh").unwrap();
-        let mut script = String::new();
-        file.read_to_string(&mut script).unwrap();
-
-        panic!(
-            "{:#?}",
-            parse_statements(
-                &script as &str
-            ).collect::<Vec<_>>()
-        );
+        assert_eq!(
+            out.unwrap().0,
+            Expression::Concat(
+                vec![
+                    Expression::Expand(
+                        box Statement::FunctionCall(
+                            vec![],
+                            Expression::Literal("eval".into()),
+                            vec![
+                                Expression::Literal("pwd".into()),
+                            ],
+                        )
+                    ),
+                    Expression::Literal("/first-file".into()),
+                ]
+            )
+        )
     }
 }
