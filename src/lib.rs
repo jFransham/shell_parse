@@ -16,21 +16,17 @@ pub struct FunctionDef(Vec<Statement>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    FunctionDef {
-        name: String,
-        body: FunctionDef,
-    },
-    FunctionCall(Expression, Vec<Expression>),
+    FunctionDef(VariableName, Box<Statement>),
+    Block(Vec<Statement>),
+    FunctionCall(
+        Vec<(VariableName, Expression)>,
+        Expression,
+        Vec<Expression>
+    ),
     IfStatement(Box<Statement>, Vec<Statement>),
-    // Acts like a linked list - can we do better?
-    // This also makes the `None` case unnecessarily difficult to handle -
-    // we should have seperate "set parameters" and "with env" cases, but that's
-    // hard to parse correctly.
-    // Probably the best thing to do is have a `parse_statement_or_env` fn
-    // seperate from `parse_statement`
-    // Maybe parse into an explicit `WithEnv`/`Statement` ADT and then flatten
-    // that into a `Statement`
-    WithEnv((VariableName, Expression), Option<Box<Statement>>),
+    WhileStatement(Box<Statement>, Vec<Statement>),
+    ForStatement(VariableName, Vec<Expression>, Vec<Statement>),
+    SetParameters(Vec<(VariableName, Expression)>),
 }
 
 // TODO: Make this Rc<str>
@@ -116,6 +112,9 @@ pub enum Expression {
     Concat(Vec<Expression>),
     // Ideally convert this to use Rc<str> so we can do simple reference
     // equality
+    // TODO: Replace `LookupBehavior` here with `Option<Box<LookupBehaviour>>`
+    //       to save space (we allocate so much anyway so the extra box probably
+    //       won't matter)
     VariableReference(VariableReference, LookupBehavior),
     Expand(Box<Statement>),
     Escape(Box<Expression>),
@@ -153,20 +152,22 @@ fn comment_or_newline<R: Stream<Item=char>>(
 }
 
 fn statement_terminator<R: Stream<Item=char>>(
-    input: R,
+    input: R
 ) -> ParseResult<(), R> {
-    try(
-        (
-            optional(parser(mandatory_whitespace)),
-            choice(
-                [
-                    &mut parser(comment_or_newline) as RefParse<_, _>,
-                    &mut token(';').map(|_| ()),
-                ]
-            ),
-            optional(parser(mandatory_whitespace)),
+    skip_many1(
+        try(
+            (
+                parser(whitespace),
+                choice(
+                    [
+                        &mut parser(comment_or_newline) as RefParse<_, _>,
+                        &mut token(';').map(|_| ()),
+                    ]
+                ),
+                parser(whitespace),
+            )
         )
-    ).map(|_| ()).parse_stream(input)
+    ).parse_stream(input)
 }
 
 pub fn parse_statements<R: Stream<Item=char>>(
@@ -183,7 +184,7 @@ pub fn parse_statements<R: Stream<Item=char>>(
             if let Some(to_parse) = opt {
                 let parsed = (
                     parser(parse_statement),
-                    skip_many1(parser(statement_terminator)),
+                    parser(statement_terminator),
                 ).parse_stream(to_parse);
 
                 if let Ok(((out, _), rest)) = parsed {
@@ -200,7 +201,7 @@ pub fn parse_statements<R: Stream<Item=char>>(
     }
 
     let to_first_statement =
-        skip_many(parser(statement_terminator)).parse_stream(input);
+        optional(parser(statement_terminator)).parse_stream(input);
 
     StatementStream(to_first_statement.map(|(_, r)| r.into_inner()).ok())
 }
@@ -220,9 +221,9 @@ fn escaped_newline<R: Stream<Item=char>>(
     ).map(|_| ()).parse_stream(input)
 }
 
-fn mandatory_whitespace<R: Stream<Item=char>>(
-    input: R
-) -> ParseResult<(), R> {
+fn mandatory_whitespace<R: Stream<Item=char>>(input: R) ->
+    ParseResult<(), R>
+{
     skip_many1(
         choice(
             [
@@ -237,101 +238,191 @@ fn mandatory_whitespace<R: Stream<Item=char>>(
     ).parse_stream(input)
 }
 
+fn whitespace<R: Stream<Item=char>>(input: R) ->
+    ParseResult<Option<()>, R>
+{
+    optional(parser(mandatory_whitespace)).parse_stream(input)
+}
+
 pub fn parse_statement<R: Stream<Item=char>>(
     input: R,
 ) -> ParseResult<Statement, R> {
-    fn whitespace<R: Stream<Item=char>>() ->
-        impl Parser<Input=R, Output=Option<()>>
+    fn loop_body<R: Stream<Item=char>>(input: R) ->
+        ParseResult<Vec<Statement>, R>
     {
-        optional(parser(mandatory_whitespace))
+        between(
+            (
+                string("do"),
+                optional(parser(statement_terminator)),
+                parser(whitespace),
+            ),
+            string("done"),
+            many1(
+                try(
+                    (
+                        parser(parse_statement),
+                        parser(statement_terminator),
+                    )
+                ).map(|(s, _)| s)
+            )
+        ).parse_stream(input)
     }
 
-    fn set_variable<R: Stream<Item=char>>() ->
-        impl Parser<Input=R, Output=(VariableName, Expression)>
+    fn func_call<R: Stream<Item=char>>(input: R) ->
+        ParseResult<(Expression, Vec<Expression>), R>
     {
+        // TODO: Add esac
+        let invalid_function_names = [
+            try(string("if")),
+            try(string("while")),
+            try(string("then")),
+            try(string("done")),
+            try(string("do")),
+            try(string("for")),
+            try(string("fi")),
+        ];
+
         (
-            parser(parse_ident),
-            // Don't allow whitespace here
-            token('='),
+            not_followed_by(
+                (
+                    choice(invalid_function_names),
+                    not_followed_by(satisfy(is_ident)),
+                ).map(|(name, _)| name)
+            ),
             parser(parse_expression),
-        ).map(|(name, _, exp)| (name, exp))
+            many(
+                try(
+                    (
+                        parser(mandatory_whitespace),
+                        parser(parse_expression)
+                    )
+                ).map(|(_, exp)| exp)
+            ),
+        ).map(|(_, name, args)| (name, args))
+            .parse_stream(input)
     }
-
-    // TODO: Add esac, done
-    let invalid_function_names = [
-        string("fi"),
-    ];
 
     let mut if_statement = (
-        string("if"),
+        try(string("if")),
+        parser(mandatory_whitespace),
         parser(parse_statement),
-        (parser(statement_terminator), whitespace()),
+        (parser(statement_terminator), parser(whitespace)),
         between(
-            (string("then"), skip_many(parser(statement_terminator))),
+            (string("then"), optional(parser(statement_terminator))),
             string("fi"),
             many1(
                 try(
                     (
                         parser(parse_statement),
-                        skip_many1(parser(statement_terminator)),
+                        parser(statement_terminator),
                     )
                 ).map(|(s, _)| s)
             )
         ),
     ).map(
-        |(_, head, _, body)| Statement::IfStatement(box head, body)
+        |(_, _, head, _, body)| Statement::IfStatement(box head, body)
     );
 
     let mut env_statement = (
-        try(set_variable()),
+        many1(
+            try(
+                (
+                    parser(whitespace),
+                    ident(),
+                    token('='),
+                    parser(parse_expression),
+                )
+            ).map(|(_, name, _, val)| (name, val))
+        ),
         optional(
             (
                 parser(mandatory_whitespace),
-                parser(parse_statement),
-            )
+                parser(func_call),
+            ).map(|(_, target)| target)
         ),
     ).map(
         |(vars, opt_stmt): (_, Option<_>)|
-        Statement::WithEnv(
-            vars,
-            opt_stmt.map(|(_, stmt)| box stmt),
-        )
+        if let Some((head, args)) = opt_stmt {
+            Statement::FunctionCall(
+                vars,
+                head,
+                args,
+            )
+        } else {
+            Statement::SetParameters(vars)
+        }
     );
 
-    let mut func_call = (
-        not_followed_by(choice(invalid_function_names)),
-        parser(parse_expression),
-        many(
-            try(
-                (
-                    // TODO: We waste time re-parsing whitespace here after
-                    //       the last expression, since the
-                    //       `parse_expression` will fail and then the
-                    //       whitespace will get rolled back. This is only
-                    //       an issue for EOL whitespace and line
-                    //       continuations, so it's not so bad, but we can
-                    //       do better.
-                    //
-                    //       Maybe switch the order of these two statements?
-                    parser(mandatory_whitespace),
-                    parser(parse_expression)
-                )
-            ).map(|(_, exp)| exp)
-        ),
-    ).map(|(_, name, args)| Statement::FunctionCall(name, args));
+    let mut raw_func_call = parser(func_call).map(
+        |(head, args)|
+        Statement::FunctionCall(vec![], head, args)
+    );
 
-    (
-        whitespace(),
-        choice([
-            &mut env_statement as RefParse<_, _>,
-            &mut if_statement,
-            &mut func_call,
-        ]),
-        whitespace(),
+    let mut while_statement = (
+        try(string("while")),
+        parser(mandatory_whitespace),
+        parser(parse_statement),
+        parser(statement_terminator),
+        parser(loop_body),
     ).map(
-        |(_, s, _)| s
-    ).parse_stream(input)
+        |(_, _, head, _, body)| Statement::WhileStatement(box head, body)
+    );
+
+    let mut for_statement = (
+        (
+            try(string("for")),
+            parser(mandatory_whitespace),
+        ),
+        ident(),
+        (
+            parser(mandatory_whitespace),
+            try(string("in")),
+            parser(mandatory_whitespace),
+        ),
+        many1(parser(parse_expression)),
+        (parser(statement_terminator), parser(whitespace)),
+        parser(loop_body),
+    ).map(
+        |(_, name, _, head, _, body)|
+        Statement::ForStatement(name, head, body)
+    );
+
+    let mut function_definition = try(
+        (
+            ident(),
+            (
+                parser(whitespace),
+                token('('),
+                parser(whitespace),
+                token(')'),
+                parser(whitespace),
+            ),
+            parser(parse_statement),
+        )
+    ).map(|(name, _,  body)| Statement::FunctionDef(name, box body));
+
+    let mut block = between(
+        token('{'),
+        token('}'),
+        many1(
+            (
+                parser(parse_statement),
+                parser(statement_terminator)
+            ).map(|(stmt, _)| stmt)
+        )
+    ).map(|block| Statement::Block(block));
+
+    choice([
+        &mut block as RefParse<_, _>,
+        &mut if_statement,
+        &mut while_statement,
+        &mut for_statement,
+        &mut function_definition,
+        &mut env_statement,
+        &mut raw_func_call,
+    ]).parse_stream(input)
 }
+
 pub fn parse_raw_string_char<R: Stream<Item=char>>(
     input: R
 ) -> ParseResult<char, R> {
@@ -556,10 +647,10 @@ fn is_ident_start(c: char) -> bool {
         (c == ']')
 }
 
-fn parse_ident<R: Stream<Item=char>>(input: R) -> ParseResult<String, R> {
+fn ident<R: Stream<Item=char>>() -> impl Parser<Input=R, Output=String> {
     (satisfy(is_ident_start), many(satisfy(is_ident))).map(
         |(left, rest): (char, String)| format!("{}{}", left, rest)
-    ).parse_stream(input)
+    )
 }
 
 fn parse_variable_reference<R: Stream<Item=char>>(
@@ -576,7 +667,7 @@ fn parse_variable_reference<R: Stream<Item=char>>(
             ).map(
                 |_| VariableReference::Magic(MagicVar::LastLastArgument)
             ) as RefParse<_, _>,
-            &mut parser(parse_ident).map(String::into),
+            &mut ident().map(String::into),
             &mut choice([
                 &mut token('0').map(|_| MagicVar::ScriptName)
                     as RefParse<_, _>,
@@ -937,9 +1028,10 @@ mod tests {
     fn statement() {
         assert_eq!(
             parse_statement(
-                "   ls -clt $PWD \n"
+                "ls -clt $PWD \n"
             ).unwrap().0,
             Statement::FunctionCall(
+                vec![],
                 Expression::Literal("ls".into()),
                 vec![
                     Expression::Literal(
@@ -958,9 +1050,10 @@ mod tests {
     fn comments() {
         assert_eq!(
             parse_statement(
-                "   ls -clt $PWD # Hello, world! \n"
+                "ls -clt $PWD # Hello, world! \n"
             ).unwrap().0,
             Statement::FunctionCall(
+                vec![],
                 Expression::Literal("ls".into()),
                 vec![
                     Expression::Literal(
@@ -979,9 +1072,10 @@ mod tests {
     fn literal_newline() {
         assert_eq!(
             parse_statement(
-                "   ls -clt \\\n   $PWD;"
+                "ls -clt \\\n   $PWD;"
             ).unwrap().0,
             Statement::FunctionCall(
+                vec![],
                 Expression::Literal("ls".into()),
                 vec![
                     Expression::Literal(
@@ -1006,6 +1100,7 @@ mod tests {
         assert_eq!(
             out.unwrap().0,
             Statement::FunctionCall(
+                vec![],
                 Expression::VariableReference(
                     "CC".into(),
                     LookupBehavior {
@@ -1112,10 +1207,12 @@ mod tests {
         assert_eq!(
             out.unwrap().0,
             Statement::FunctionCall(
+                vec![],
                 Expression::Literal("echo".into()),
                 vec![
                     Expression::Expand(
                         box Statement::FunctionCall(
+                            vec![],
                             Expression::Literal(
                                 "echo".into()
                             ),
@@ -1138,25 +1235,30 @@ mod tests {
         
         assert_eq!(
             out.unwrap().0,
-            Statement::WithEnv(
-                (
-                    "first".into(),
-                    Expression::Literal("1".into()),
-                ),
-                Some(
-                    box Statement::WithEnv(
-                        (
-                            "second".into(),
-                            Expression::VariableReference(
-                                "first".into(),
-                                Default::default(),
-                            ),
+            Statement::SetParameters(
+                vec![
+                    (
+                        "first".into(),
+                        Expression::Literal("1".into()),
+                    ),
+                    (
+                        "second".into(),
+                        Expression::VariableReference(
+                            "first".into(),
+                            Default::default(),
                         ),
-                        None,
                     )
-                ),
+                ]
             )
         )
+    }
+
+    #[test]
+    fn statement_term() {
+        let out = parser(statement_terminator).parse_stream(
+            "    ;     "
+        );
+        out.unwrap();
     }
 
     #[test]
@@ -1165,31 +1267,25 @@ mod tests {
         
         assert_eq!(
             out.unwrap().0,
-            Statement::WithEnv(
-                (
-                    "first".into(),
-                    Expression::Literal("1".into())
-                ),
-                Some(
-                    box Statement::WithEnv(
-                        (
-                            "second".into(),
-                            Expression::VariableReference(
-                                "first".into(),
-                                Default::default(),
-                            )
-                        ),
-                        Some(
-                            box Statement::FunctionCall(
-                                Expression::Literal("do_thing".into()),
-                                vec![
-                                    Expression::Literal("one".into()),
-                                    Expression::Literal("two".into()),
-                                ]
-                            )
+            Statement::FunctionCall(
+                vec![
+                    (
+                        "first".into(),
+                        Expression::Literal("1".into())
+                    ),
+                    (
+                        "second".into(),
+                        Expression::VariableReference(
+                            "first".into(),
+                            Default::default(),
                         )
-                    )
-                )
+                    ),
+                ],
+                Expression::Literal("do_thing".into()),
+                vec![
+                    Expression::Literal("one".into()),
+                    Expression::Literal("two".into()),
+                ]
             )
         )
     }
@@ -1202,6 +1298,7 @@ mod tests {
             out.unwrap().0,
             Statement::IfStatement(
                 box Statement::FunctionCall(
+                    vec![],
                     Expression::Literal("test".into()),
                     vec![
                         Expression::Literal("1".into()),
@@ -1211,6 +1308,89 @@ mod tests {
                 ),
                 vec![
                     Statement::FunctionCall(
+                        vec![],
+                        Expression::Literal("echo".into()),
+                        vec![
+                            Expression::Literal("test".into()),
+                        ]
+                    ),
+                ]
+            )
+        )
+    }
+
+    #[test]
+    fn multiline_if() {
+        let out = parse_statement(
+            r#"if [ 1 -le 2 ]; then
+                echo test
+              fi
+"#);
+        
+        assert_eq!(
+            out.unwrap().0,
+            Statement::IfStatement(
+                box Statement::FunctionCall(
+                    vec![],
+                    Expression::Literal("[".into()),
+                    vec![
+                        Expression::Literal("1".into()),
+                        Expression::Literal("-le".into()),
+                        Expression::Literal("2".into()),
+                        Expression::Literal("]".into()),
+                    ]
+                ),
+                vec![
+                    Statement::FunctionCall(
+                        vec![],
+                        Expression::Literal("echo".into()),
+                        vec![
+                            Expression::Literal("test".into()),
+                        ]
+                    ),
+                ]
+            )
+        )
+    }
+
+    #[test]
+    fn test_command() {
+        let out = parse_statement("[ 1 -le 2 ]");
+
+        assert_eq!(
+            out.unwrap().0,
+            Statement::FunctionCall(
+                vec![],
+                Expression::Literal("[".into()),
+                vec![
+                    Expression::Literal("1".into()),
+                    Expression::Literal("-le".into()),
+                    Expression::Literal("2".into()),
+                    Expression::Literal("]".into()),
+                ]
+            )
+        )
+    }
+
+    #[test]
+    fn while_loop() {
+        let out = parse_statement("while test 1 -le 2; do echo test; done");
+
+        assert_eq!(
+            out.unwrap().0,
+            Statement::WhileStatement(
+                box Statement::FunctionCall(
+                    vec![],
+                    Expression::Literal("test".into()),
+                    vec![
+                        Expression::Literal("1".into()),
+                        Expression::Literal("-le".into()),
+                        Expression::Literal("2".into()),
+                    ]
+                ),
+                vec![
+                    Statement::FunctionCall(
+                        vec![],
                         Expression::Literal("echo".into()),
                         vec![
                             Expression::Literal("test".into()),
