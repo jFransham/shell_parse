@@ -8,12 +8,6 @@ use combine::char::*;
 use std::iter;
 use std::rc::Rc;
 
-// TODO: Just store string slice and lazily create function? Probably not worth
-//       it, unused functions are rare and users can just use `shellcheck` to
-//       lint against it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FunctionDef(Vec<Statement>);
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     FunctionDef(VariableName, Box<Statement>),
@@ -170,6 +164,43 @@ fn statement_terminator<R: Stream<Item=char>>(
     ).parse_stream(input)
 }
 
+/// Returns a lazy iterator over statements. This won't execute any code, but
+/// may cause unbounded memory usage, so don't use it for untrusted inputs.
+///
+/// ```rust
+/// use shell_parse::{parse_statements, Statement, Expression};
+///
+/// let test_string = r#"
+/// ## Ok guys, here's the plan. We're going to steal all of Google.
+/// GOOGLE=$(curl http://google.com); echo $GOOGLE
+/// exit 0
+/// "#;
+/// let mut statements = parse_statements(test_string);
+///
+/// assert_eq!(
+///     statements.next().expect("No statements found!"),
+///     Statement::SetParameters(
+///         vec![
+///             (
+///                 "GOOGLE".into(),
+///                 Expression::Expand(
+///                     Box::new(
+///                         Statement::FunctionCall(
+///                             vec![],
+///                             Expression::Literal("curl".into()),
+///                             vec![
+///                                 Expression::Literal(
+///                                     "http://google.com".into()
+///                                 )
+///                             ],
+///                         )
+///                     )
+///                 )
+///             )
+///         ]
+///     )
+/// );
+/// ```
 pub fn parse_statements<R: Stream<Item=char>>(
     input: R,
 ) -> impl Iterator<Item=Statement> {
@@ -489,7 +520,7 @@ fn parse_one_expression_or_string<R: Stream<Item=char>>(
                         &mut try(escaped_backslash) as RefParse<_, _>,
                         // We `try` here since we want to allow backslashes to be
                         // interpolated literally if they don't have anything to escape.
-                        // I'm pretty sure this is the POSIX/Dash behaviour. 
+                        // I'm pretty sure this is the POSIX/Dash behaviour.
                         &mut try(escaped_backtick),
                         &mut anything_else,
                     ])
@@ -1029,7 +1060,7 @@ mod tests {
                     Expression::Glob(Glob::One),
                     Expression::Literal("txt".into()),
                 ]
-            ) 
+            )
         );
     }
 
@@ -1051,7 +1082,7 @@ mod tests {
                         Default::default(),
                     ),
                 ]
-            ) 
+            )
         );
     }
 
@@ -1073,7 +1104,7 @@ mod tests {
                         Default::default(),
                     ),
                 ]
-            ) 
+            )
         );
     }
 
@@ -1095,7 +1126,23 @@ mod tests {
                         Default::default(),
                     ),
                 ]
-            ) 
+            )
+        );
+    }
+
+    #[test]
+    fn parse_url() {
+        let out = parse_expression("$(curl http://example.com)");
+
+        assert_eq!(
+            out.unwrap().0,
+            Expression::Expand(
+                box Statement::FunctionCall(
+                    vec![],
+                    Expression::Literal("curl".into()),
+                    vec![Expression::Literal("http://example.com".into())],
+                )
+            )
         );
     }
 
@@ -1241,7 +1288,7 @@ mod tests {
     #[test]
     fn set_vars() {
         let out = parse_statement("first=1 second=$first");
-        
+
         assert_eq!(
             out.unwrap().0,
             Statement::SetParameters(
@@ -1271,9 +1318,17 @@ mod tests {
     }
 
     #[test]
+    fn statement_term_nl() {
+        let out = parser(statement_terminator).parse_stream(
+            "    \n     "
+        );
+        out.unwrap();
+    }
+
+    #[test]
     fn run_with_vars() {
         let out = parse_statement("first=1 second=$first do_thing one two");
-        
+
         assert_eq!(
             out.unwrap().0,
             Statement::FunctionCall(
@@ -1302,7 +1357,7 @@ mod tests {
     #[test]
     fn if_statement() {
         let out = parse_statement("if test 1 -le 2; then; echo test; fi");
-        
+
         assert_eq!(
             out.unwrap().0,
             Statement::IfStatement(
@@ -1335,7 +1390,7 @@ mod tests {
                 echo test
               fi
 "#);
-        
+
         assert_eq!(
             out.unwrap().0,
             Statement::IfStatement(
